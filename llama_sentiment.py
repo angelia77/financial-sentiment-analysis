@@ -22,7 +22,7 @@ import re
 login(token="TOKEN")
 
 class SentimentAnalyzer:
-    def __init__(self, model_name="meta-llama/Meta-Llama-3-8B"):
+    def __init__(self, model_name="meta-llama/Meta-Llama-3-8B-Instruct"):
         self.model_name = model_name
         self.tokenizer = None
         self.model = None
@@ -32,7 +32,6 @@ class SentimentAnalyzer:
         print(f"Loading model: {self.model_name} and tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, padding_side="left")
 
-        # Configure BitsAndBytesConfig for quantization if needed for memory
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -42,104 +41,113 @@ class SentimentAnalyzer:
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            torch_dtype=torch.float16,   # Required for GPU compatibility and performance
+            torch_dtype=torch.float16,
             quantization_config=bnb_config,
-            device_map="auto" # Automatically maps layers to available devices (GPU first)
+            device_map="auto"
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         print("Model and tokenizer loaded.")
 
-
     def get_sentiment_llama3(self, texts):
-        """
-        Analyzes the sentiment of a batch of texts using the loaded Llama model.
-        Args:
-            texts (list): A list of text strings to analyze.
-        Returns:
-            list: A list of sentiment scores (integers from 1 to 10) for each text,
-                  or None if a score could not be extracted.
-        """
-
-        sentiment_scores = []
+        sentiment_results = []
         system_prompt = (
-            '''You are an experienced financial analyst; analyze the text in { } carefully and assign a sentiment score to it. Please provide ONLY a single number as your answer.
+            '''You are an experienced financial analyst. Analyze the sentiment of the text in { } carefully.
 
             Scoring Guide:
-            0: Negative sentiment
-            1: Neutral sentiment
-            2: Positive sentiment
+            Assign a number from 0-9
+            0: Most negative sentiment
+            4-5: Neutral sentiment
+            9: Mostositive sentiment
+
+            Provide your answer in the following format:
+            Score: [Your Score]
+            Explanation: [Your detailed explanation for the score]
 
             Example 1:
             {The company is bankrupt and sales are declining fast.}
-            Answer: 0
+            Answer:
+            Score: 1
+            Explanation: The text mentions bankruptcy and declining sales, which are strong indicators of negative financial performance.
 
             Example 2:
             {Earnings remained stable, and outlook is neutral pending market changes.}
-            Answer: 1
+            Answer:
+            Score: 4
+            Explanation: The text explicitly states that earnings are stable and the outlook is neutral, indicating no strong positive or negative sentiment.
 
             Example 3:
             {Revenue, profits, and guidance all significantly exceeded expectations.}
-            Answer: 2'''
+            Answer:
+            Score: 8
+            Explanation: The text highlights that key financial metrics (revenue, profits, guidance) significantly exceeded expectations, which is a strong positive indicator.'''
         )
 
         try:
             prompts = [f"<|system|>\n{system_prompt}\n<|user|>\n{{{text}}}\n<|assistant|>\n" for text in texts]
 
-            inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(self.model.device)
+            inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=512).to(self.model.device)
 
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=5,
-                do_sample=False
+                max_new_tokens=100, # Increase tokens to allow for explanation
+                do_sample=False,
+                pad_token_id=self.tokenizer.eos_token_id
             )
 
             decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
-            for i, (text, decoded) in enumerate(zip(texts, decoded_outputs)):
-                # print(f"Decoded output: {decoded}") # print output for debugging
-                match = re.search(r"<\|assistant\|>\s*(\d+)\b", decoded)
-                if not match:
-                    # Try fallback: find last integer in the decoded string
-                    numbers = [int(s) for s in re.findall(r"\b(\d+)\b", decoded)]
-                    score = numbers[-1] if numbers else None
-                else:
-                    score = int(match.group(1))
-                sentiment_scores.append(score)
+            for decoded in decoded_outputs:
+                score = None
+                explanation = None
 
+                # Extract the part after <|assistant|>
+                assistant_text_match = re.search(r"<\|assistant\|>\s*(.*)", decoded, re.S)
+                if assistant_text_match:
+                    assistant_output = assistant_text_match.group(1).strip()
+
+                    # Extract Score
+                    score_match = re.search(r"Score:\s*(\d+)\b", assistant_output)
+                    if score_match:
+                        score = int(score_match.group(1))
+
+                    # Extract Explanation
+                    explanation_match = re.search(r"Explanation:\s*(.*)", assistant_output, re.S)
+                    if explanation_match:
+                        explanation = explanation_match.group(1).strip()
+
+                sentiment_results.append({'score': score, 'explanation': explanation})
 
         except Exception as e:
             print(f"Error processing batch: {e}")
-            sentiment_scores.extend([None] * len(texts))
+            sentiment_results.extend([{'score': None, 'explanation': f"Error: {e}"}] * len(texts))
 
-            sentiment_scores.append(score)
-
-        return sentiment_scores
+        return sentiment_results
 
 
     def process_dataframe(self, df, text_column, batch_size=10):
         """
-        Processes a pandas DataFrame to add a sentiment score column.
+        Processes a pandas DataFrame to add sentiment score and explanation columns.
         Args:
             df (pd.DataFrame): The input DataFrame.
             text_column (str): The name of the column containing the text to analyze.
             batch_size (int): The number of texts to process in each batch.
         Returns:
-            pd.DataFrame: The DataFrame with a new 'sentiment_score' column.
+            pd.DataFrame: The DataFrame with new 'sentiment_score' and 'explanation' columns.
         """
-        all_sentiment_scores = []
+        all_results = []
         total_batches = (len(df) + batch_size - 1) // batch_size
         print(f"Processing {len(df)} texts in {total_batches} batches with batch size {batch_size}...")
 
         for i in range(0, len(df), batch_size):
             print(f"Processing batch {i // batch_size + 1}/{total_batches}...")
             batch_texts = df[text_column][i:i+batch_size].tolist()
-            batch_sentiments = self.get_sentiment_llama3(batch_texts)
-            all_sentiment_scores.extend(batch_sentiments)
+            batch_results = self.get_sentiment_llama3(batch_texts)
+            all_results.extend(batch_results)
 
-        df['sentiment_score'] = all_sentiment_scores
+        df['sentiment_score'] = [res['score'] for res in all_results]
+        df['explanation'] = [res['explanation'] for res in all_results]
         return df
-
 
 data = {'component_text': [
     "We will lose money.",
@@ -155,10 +163,13 @@ data = {'component_text': [
 ]}
 df = pd.DataFrame(data)
 
-# Process the DataFrame
-analyzer = SentimentAnalyzer()
-df_with_sentiment = analyzer.process_dataframe(df, 'component_text', batch_size=10) # Adjusted batch size for testing
+# Ensure the model name is the instruct version for chat-like formatting
+analyzer = SentimentAnalyzer(model_name="meta-llama/Meta-Llama-3-8B-Instruct")
+df_with_sentiment = analyzer.process_dataframe(df, 'component_text', batch_size=10)
 
 # Display the updated DataFrame
-print("\nDataFrame with Sentiment Scores:")
+print("\nDataFrame with Sentiment Scores and Explanations:")
 df_with_sentiment
+
+# Save the output df to a csv
+df_with_sentiment.to_csv('sentiment_output.csv', index=False)
