@@ -1,0 +1,53 @@
+import subprocess
+import pandas as pd
+import os
+import math
+from time import sleep
+
+INPUT_FILE = "data/full_dataset.csv"
+TEXT_COLUMN = "text"
+CHUNK_SIZE = 1000
+MAX_PARALLEL_JOBS = 5
+SCRIPT = "data_preprocessor_summary.py"
+OUTPUT_DIR = "data/processed"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Load the full dataset once
+df = pd.read_csv(INPUT_FILE)
+total_rows = len(df)
+num_chunks = math.ceil(total_rows / CHUNK_SIZE)
+
+processes = []
+
+for i in range(num_chunks):
+    start = i * CHUNK_SIZE
+    end = min((i + 1) * CHUNK_SIZE, total_rows)
+    chunk_df = df.iloc[start:end]
+    chunk_file = f"{OUTPUT_DIR}/chunk_{i}.csv"
+    output_file = f"{OUTPUT_DIR}/summarized_{i}.csv"
+
+    # Save chunk to temp CSV
+    chunk_df.to_csv(chunk_file, index=False)
+
+    # Launch subprocess
+    cmd = [
+        "python", SCRIPT,
+        "--input", chunk_file,
+        "--text_column", TEXT_COLUMN,
+        "--output", output_file
+    ]
+    proc = subprocess.Popen(cmd)
+    processes.append(proc)
+
+    # Wait if max parallel is reached
+    if len(processes) >= MAX_PARALLEL_JOBS:
+        for p in processes:
+            p.wait()
+        processes = []
+
+# Final wait for leftover jobs
+for p in processes:
+    p.wait()
+
+print("✅ All jobs completed.")
