@@ -42,3 +42,21 @@ class FinancialTextPreprocessor:
             print(f"Saved summarized data to {output_file}")
 
         return df
+
+
+def get_log_return_21d(ticker, date):
+    try:
+        data = yf.download(ticker, start=date, end=date + pd.Timedelta(days=45), progress=False)
+        data = data["Adj Close"].dropna()
+        if len(data) >= 22:
+            p0 = data.iloc[0]
+            p21 = data.iloc[21]
+            return np.log(p21 / p0)
+    except:
+        return np.nan
+    return np.nan
+
+df["log_return_21d"] = df.apply(
+    lambda row: get_log_return_21d(row["company_ticker"], row["date"]),
+    axis=1
+)
